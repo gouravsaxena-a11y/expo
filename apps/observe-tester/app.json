@@ -46,6 +46,7 @@
         }
       ],
       ["./plugins/withCrashOnLaunch", { "android": false, "ios": false }],
+      "./plugins/withUISceneLifecycle",
       [
         "expo-build-properties",
         {
