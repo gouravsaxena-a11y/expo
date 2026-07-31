@@ -1,24 +1,332 @@
----
-title: app.json / app.config.js
-description: A reference of available properties in Expo app config.
-maxHeadingDepth: 5
----
+{
+  "expo": {
+    "name": "OdometerTrackerApp",
+    "slug": "odometer-tracker-app",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#ffffff"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.odometertracker.app",
+      "infoPlist": {
+        "NSCameraUsageDescription": "This app uses the camera to scan odometer readings.",
+        "NSLocationWhenInUseUsageDescription": "This app requires location to verify trip start and end points.",
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "This app requires background location for geofencing job sites.",
+        "UIBackgroundModes": ["location", "fetch"]
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#ffffff"
+      },
+      "package": "com.odometertracker.app",
+      "permissions": [
+        "CAMERA",
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_BACKGROUND_LOCATION"
+      ]
+    },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow camera access to capture odometer numbers."
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "Allow location access to verify geofenced zones.",
+          "isAndroidBackgroundLocationEnabled": true
+        }
+      ]
+    ]
+  }
+}
+import React, { useState, useRef, useEffect } from 'react';
+import {
+  StyleSheet,
+  Text,
+  View,
+  TouchableOpacity,
+  TextInput,
+  ScrollView,
+  Image,
+  Dimensions,
+  ActivityIndicator,
+  Alert,
+} from 'react-native';
+import { CameraView, useCameraPermissions } from 'expo-camera';
+import * as ImageManipulator from 'expo-image-manipulator';
+import * as Location from 'expo-location';
+import TextRecognition from '@react-native-ml-kit/text-recognition';
+import distance from '@turf/distance';
+import { point } from '@turf/helpers';
 
-import { BookOpen02Icon } from '@expo/styleguide-icons/outline/BookOpen02Icon';
+const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 
-import schema from '~/public/static/schemas/unversioned/app-config-schema.json';
-import AppConfigSchemaTable from '~/ui/components/AppConfigSchemaTable';
-import { BoxLink } from '~/ui/components/BoxLink';
+// Crop Box Geometry
+const CROP_WIDTH = SCREEN_WIDTH * 0.8;
+const CROP_HEIGHT = 100;
+const CROP_TOP = (SCREEN_HEIGHT - CROP_HEIGHT) / 2 - 40;
+const CROP_LEFT = (SCREEN_WIDTH - CROP_WIDTH) / 2;
 
-The following is a list of properties that are available for you under the `"expo"` key in **app.json** or **app.config.json**. These properties can be passed to the top level object of **app.config.js** or **app.config.ts**.
+// Target Geofence Zone (Example Depot)
+const DEPOT_GEOFENCE = {
+  latitude: 30.7333,
+  longitude: 76.7794,
+  radiusMeters: 500,
+};
 
-<BoxLink
-  title="Configuration with app config"
-  description="For information on app configuration, the differences between various app config files, and how to use them dynamically."
-  href="/workflow/configuration/"
-  Icon={BookOpen02Icon}
-/>
+export default function App() {
+  const [permission, requestPermission] = useCameraPermissions();
+  const cameraRef = useRef(null);
 
-## Properties
+  // App State
+  const [cameraMode, setCameraMode] = useState(null); // 'start' | 'end' | null
+  const [torch, setTorch] = useState(false);
+  const [loading, setLoading] = useState(false);
 
-<AppConfigSchemaTable schema={schema} />
+  // Trip Data State
+  const [startKm, setStartKm] = useState('');
+  const [endKm, setEndKm] = useState('');
+  const [startPhoto, setStartPhoto] = useState(null);
+  const [endPhoto, setEndPhoto] = useState(null);
+  const [startGeofence, setStartGeofence] = useState('Not Verified');
+  const [endGeofence, setEndGeofence] = useState('Not Verified');
+
+  // Verify Geofence helper
+  const checkGeofence = (coords) => {
+    const userPt = point([coords.longitude, coords.latitude]);
+    const fencePt = point([DEPOT_GEOFENCE.longitude, DEPOT_GEOFENCE.latitude]);
+    const distMeters = distance(userPt, fencePt, { units: 'kilometers' }) * 1000;
+    return distMeters <= DEPOT_GEOFENCE.radiusMeters;
+  };
+
+  // OCR Processing
+  const processOdometerImage = async (imageUri) => {
+    try {
+      const result = await TextRecognition.recognize(imageUri);
+      const candidates = [];
+
+      for (const block of result.blocks) {
+        for (const line of block.lines) {
+          const cleaned = line.text.replace(/[\s,]/g, '');
+          const matches = cleaned.match(/\b\d{4,7}\b/g);
+          if (matches) {
+            matches.forEach((num) => candidates.push(parseInt(num, 10)));
+          }
+        }
+      }
+
+      return candidates.length > 0 ? Math.max(...candidates) : null;
+    } catch (e) {
+      console.error(e);
+      return null;
+    }
+  };
+
+  // Capture & Process
+  const handleTakeAndCropPhoto = async () => {
+    if (!cameraRef.current || loading) return;
+
+    try {
+      setLoading(true);
+      const photo = await cameraRef.current.takePictureAsync({ quality: 0.8, skipProcessing: true });
+
+      // Scale coordinates to photo resolution
+      const scaleX = photo.width / SCREEN_WIDTH;
+      const scaleY = photo.height / SCREEN_HEIGHT;
+
+      const cropped = await ImageManipulator.manipulateAsync(
+        photo.uri,
+        [{
+          crop: {
+            originX: Math.round(CROP_LEFT * scaleX),
+            originY: Math.round(CROP_TOP * scaleY),
+            width: Math.round(CROP_WIDTH * scaleX),
+            height: Math.round(CROP_HEIGHT * scaleY),
+          }
+        }],
+        { format: ImageManipulator.SaveFormat.JPEG }
+      );
+
+      // Check current Location
+      const loc = await Location.getCurrentPositionAsync({});
+      const isInside = checkGeofence(loc.coords);
+      const geofenceStatus = isInside ? '🟢 Inside Zone' : '🔴 Outside Zone';
+
+      // Run OCR
+      const detectedNumber = await processOdometerImage(cropped.uri);
+
+      if (cameraMode === 'start') {
+        setStartPhoto(cropped.uri);
+        setStartGeofence(geofenceStatus);
+        if (detectedNumber) setStartKm(detectedNumber.toString());
+      } else if (cameraMode === 'end') {
+        setEndPhoto(cropped.uri);
+        setEndGeofence(geofenceStatus);
+        if (detectedNumber) setEndKm(detectedNumber.toString());
+      }
+
+      setCameraMode(null);
+    } catch (err) {
+      Alert.alert('Error', 'Failed to capture photo.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const openCamera = async (mode) => {
+    if (!permission?.granted) {
+      const res = await requestPermission();
+      if (!res.granted) return Alert.alert('Permission needed', 'Camera access required.');
+    }
+    const locPerm = await Location.requestForegroundPermissionsAsync();
+    if (!locPerm.granted) return Alert.alert('Permission needed', 'Location access required.');
+
+    setCameraMode(mode);
+  };
+
+  const calculateDistance = () => {
+    const start = parseFloat(startKm) || 0;
+    const end = parseFloat(endKm) || 0;
+    return end >= start ? end - start : 0;
+  };
+
+  // RENDER CAMERA VIEW
+  if (cameraMode) {
+    return (
+      <View style={styles.cameraContainer}>
+        <CameraView style={StyleSheet.absoluteFillObject} ref={cameraRef} enableTorch={torch}>
+          {/* CROP OVERLAY */}
+          <View style={styles.overlay}>
+            <View style={[styles.mask, { height: CROP_TOP }]} />
+            <View style={{ flexDirection: 'row', height: CROP_HEIGHT }}>
+              <View style={[styles.mask, { width: CROP_LEFT }]} />
+              <View style={styles.cropBox}>
+                <Text style={styles.cropText}>Align Odometer Digits</Text>
+              </View>
+              <View style={[styles.mask, { width: CROP_LEFT }]} />
+            </View>
+            <View style={[styles.mask, { flex: 1 }]} />
+          </View>
+
+          {/* CONTROLS */}
+          <TouchableOpacity style={styles.torchBtn} onPress={() => setTorch(!torch)}>
+            <Text style={styles.torchText}>{torch ? '⚡ Flash ON' : '⚡ Flash OFF'}</Text>
+          </TouchableOpacity>
+
+          <View style={styles.captureBox}>
+            {loading ? (
+              <ActivityIndicator size="large" color="#FFF" />
+            ) : (
+              <TouchableOpacity style={styles.captureBtn} onPress={handleTakeAndCropPhoto} />
+            )}
+          </View>
+        </CameraView>
+      </View>
+    );
+  }
+
+  // RENDER DASHBOARD
+  return (
+    <ScrollView style={styles.container} contentContainerStyle={styles.content}>
+      <Text style={styles.header}>Odometer & Geofence Logger</Text>
+
+      {/* START CARD */}
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>1. Start Trip Reading</Text>
+        <TouchableOpacity style={styles.btn} onPress={() => openCamera('start')}>
+          <Text style={styles.btnText}>📷 Capture Start Odometer</Text>
+        </TouchableOpacity>
+
+        {startPhoto && (
+          <View style={styles.previewBox}>
+            <Image source={{ uri: startPhoto }} style={styles.previewImg} />
+            <Text style={styles.geoText}>Geofence Status: {startGeofence}</Text>
+          </View>
+        )}
+
+        <TextInput
+          style={styles.input}
+          placeholder="Start Reading (km)"
+          keyboardType="numeric"
+          value={startKm}
+          onChangeText={setStartKm}
+        />
+      </View>
+
+      {/* END CARD */}
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>2. End Trip Reading</Text>
+        <TouchableOpacity style={styles.btn} onPress={() => openCamera('end')}>
+          <Text style={styles.btnText}>📷 Capture End Odometer</Text>
+        </TouchableOpacity>
+
+        {endPhoto && (
+          <View style={styles.previewBox}>
+            <Image source={{ uri: endPhoto }} style={styles.previewImg} />
+            <Text style={styles.geoText}>Geofence Status: {endGeofence}</Text>
+          </View>
+        )}
+
+        <TextInput
+          style={styles.input}
+          placeholder="End Reading (km)"
+          keyboardType="numeric"
+          value={endKm}
+          onChangeText={setEndKm}
+        />
+      </View>
+
+      {/* SUMMARY */}
+      <View style={[styles.card, styles.summaryCard]}>
+        <Text style={styles.summaryLabel}>Total Calculated Distance</Text>
+        <Text style={styles.summaryKm}>{calculateDistance().toFixed(1)} km</Text>
+      </View>
+    </ScrollView>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: '#F1F5F9' },
+  content: { padding: 20, paddingTop: 50 },
+  header: { fontSize: 22, fontWeight: 'bold', marginBottom: 20, textAlign: 'center', color: '#0F172A' },
+  card: { backgroundColor: '#FFF', borderRadius: 12, padding: 16, marginBottom: 16, elevation: 2 },
+  cardTitle: { fontSize: 16, fontWeight: 'bold', marginBottom: 12, color: '#334155' },
+  btn: { backgroundColor: '#2563EB', padding: 12, borderRadius: 8, alignItems: 'center' },
+  btnText: { color: '#FFF', fontWeight: 'bold' },
+  previewBox: { marginTop: 12 },
+  previewImg: { width: '100%', height: 100, borderRadius: 8 },
+  geoText: { marginTop: 6, fontSize: 12, color: '#475569', fontWeight: 'bold' },
+  input: { borderWidth: 1, borderColor: '#CBD5E1', borderRadius: 8, padding: 10, marginTop: 12 },
+  summaryCard: { backgroundColor: '#EFF6FF', alignItems: 'center' },
+  summaryLabel: { color: '#1E40AF', fontWeight: '600' },
+  summaryKm: { fontSize: 32, fontWeight: 'bold', color: '#1E40AF', marginTop: 4 },
+  cameraContainer: { flex: 1, backgroundColor: '#000' },
+  overlay: { ...StyleSheet.absoluteFillObject },
+  mask: { backgroundColor: 'rgba(0,0,0,0.65)' },
+  cropBox: { width: CROP_WIDTH, height: CROP_HEIGHT, borderWidth: 2, borderColor: '#22C55E', justifyContent: 'center', alignItems: 'center' },
+  cropText: { color: '#22C55E', fontWeight: 'bold', backgroundColor: 'rgba(0,0,0,0.5)', padding: 4 },
+  torchBtn: { position: 'absolute', top: 50, right: 20, backgroundColor: 'rgba(0,0,0,0.6)', padding: 10, borderRadius: 20 },
+  torchText: { color: '#FFF', fontWeight: 'bold' },
+  captureBox: { position: 'absolute', bottom: 40, width: '100%', alignItems: 'center' },
+  captureBtn: { width: 70, height: 70, borderRadius: 35, borderWidth: 4, borderColor: '#FFF', backgroundColor: '#2563EB' },
+});
+{
+ npx expo start
+npm install -g eas-cli
+eas login
+eas build:configure
+eas build -p android --profile preview}
+
+
